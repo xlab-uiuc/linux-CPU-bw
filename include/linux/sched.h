@@ -538,6 +538,14 @@ struct sched_statistics {
 #endif /* CONFIG_SCHEDSTATS */
 } ____cacheline_aligned;
 
+#ifdef CONFIG_CFS_BANDWIDTH
+/* For tracking the current sched entities on our bandwidth controller */
+struct sched_entity_entry {
+	struct sched_entity *se;
+	struct list_head list_node;
+};
+#endif
+
 struct sched_entity {
 	/* For load-balancing: */
 	struct load_weight		load;
@@ -571,6 +579,14 @@ struct sched_entity {
 	struct cfs_rq			*my_q;
 	/* cached value of my_q->h_nr_running */
 	unsigned long			runnable_weight;
+
+	/* Period agnostic runtime tracing */
+#ifdef CONFIG_CFS_BANDWIDTH
+	int pa_hist_idx;
+	u64 *pa_yield_hist;
+	u64 *pa_runtime_hist;
+	u64 pa_cpu;
+#endif /* CONFIG_CFS_BANDWIDTH */
 #endif
 
 #ifdef CONFIG_SMP

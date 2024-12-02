@@ -419,6 +419,55 @@ struct cfs_bandwidth {
 	struct hrtimer		slack_timer;
 	struct list_head	throttled_cfs_rq;
 
+	/*** Recommender User interfaces ***/
+	/*
+	 * Status interface
+	 * = 0 => off. All tracing and recommendation is short-circuited.
+	 * = 1 => Recommend only mode. Trace and make recommendations
+	 * = 2 => Auto mode. Trace, recommend and apply the recommendations
+	 */
+	u8 trace_status;
+	/*
+	 * Size of history for period bound and agnostic.
+	 * Smaller histories can lead of faster recommendations. Larger histories can
+	 * may give richer data for better recommendations.
+	 *
+	 * If history is too small, recommendation quality can be poor.
+	 * If history is too large, recommendation reactivity can be poor and the
+	 * recommendation may not even be valid as the behavior may have changed.
+	 */
+	int period_bound_history;
+	int period_agnostic_history;
+
+	/*** Period bound history ***/
+	int pb_hist_idx;
+	u64 *pb_period_hist;
+	u64 *pb_runtime_hist;
+	u64 pb_cpu;
+
+	/*** Period agnostic ***/
+	/* Most of it stored in sched_entities */
+	struct list_head	active_sched_entity;
+
+	/*** Recommendations ***/
+	u64			pa_recommender_period;
+	u64			pa_recommender_quota;
+	u64			pb_recommender_period;
+	u64			pb_recommender_quota;
+	/* Final recommendation */
+	u64			recommender_period;
+	u64			recommender_quota;
+
+	/*** Recommender local helpers ***/
+	/*
+	 * A recommender can be [in]active due to either the rec_status interface,
+	 * or when unlimited tracing is invoked and any recommendation then would
+	 * be futile.
+	 */
+	bool trace_active;
+	/* Trace unlimited invoked for a short duration during high degrees of throttle */
+	bool trace_ulim;
+
 	/* Statistics: */
 	int			nr_periods;
 	int			nr_throttled;

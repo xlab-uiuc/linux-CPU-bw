@@ -6589,6 +6589,25 @@ void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b, struct cfs_bandwidth *paren
 	hrtimer_init(&cfs_b->slack_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	cfs_b->slack_timer.function = sched_cfs_slack_timer;
 	cfs_b->slack_started = false;
+
+	/* Trace + Recommender initializers */
+	cfs_b->trace_status = 0;
+	cfs_b->period_bound_history = 5;
+	cfs_b->period_agnostic_history = 5;
+
+	cfs_b->pb_runtime_hist = kmalloc(cfs_b->period_bound_history * sizeof(u64), GFP_KERNEL);
+	cfs_b->pb_period_hist = kmalloc(cfs_b->period_bound_history * sizeof(u64), GFP_KERNEL);
+	cfs_b->pb_hist_idx = 0;
+	cfs_b->pb_cpu = 0;
+
+	INIT_LIST_HEAD(&cfs_b->active_sched_entity);
+
+	cfs_b->pa_recommender_period = 0;
+	cfs_b->pa_recommender_quota = 0;
+	cfs_b->pb_recommender_period = 0;
+	cfs_b->pb_recommender_quota = 0;
+	cfs_b->recommender_period = ns_to_ktime(default_cfs_period());;
+	cfs_b->recommender_quota = RUNTIME_INF;
 }
 
 static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq)

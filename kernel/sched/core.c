@@ -4420,6 +4420,10 @@ int wake_up_state(struct task_struct *p, unsigned int state)
 	return try_to_wake_up(p, state, 0);
 }
 
+static inline struct cfs_bandwidth *tg_cfs_bandwidth(struct task_group *tg)
+{
+	return &tg->cfs_bandwidth;
+}
 /*
  * Perform scheduler related setup for a newly forked process p.
  * p is forked by current.
@@ -4444,6 +4448,14 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	p->se.cfs_rq			= NULL;
+#ifdef CONFIG_CFS_BANDWIDTH
+	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(p->sched_task_group);
+
+	p->se.pa_hist_idx = 0;
+	p->se.pa_cpu = 0;
+	p->se.pa_yield_hist = kmalloc(cfs_b->period_agnostic_history * sizeof(u64), GFP_KERNEL);
+	p->se.pa_runtime_hist = kmalloc(cfs_b->period_agnostic_history * sizeof(u64), GFP_KERNEL);
+#endif /* CONFIG_CFS_BANDWIDTH */
 #endif
 
 #ifdef CONFIG_SCHEDSTATS
@@ -9905,6 +9917,106 @@ static ssize_t cpu_max_write(struct kernfs_open_file *of,
 		ret = tg_set_cfs_bandwidth(tg, period, quota, burst);
 	return ret ?: nbytes;
 }
+
+static s64 cpu_trace_status_read_s64(struct cgroup_subsys_state *css,
+				     struct cftype *cft)
+{
+       return css_tg(css)->cfs_bandwidth.trace_status;
+}
+
+static int cpu_trace_status_write_s64(struct cgroup_subsys_state *css,
+				      struct cftype *cft, s64 status)
+{
+	struct task_group *tg = css_tg(css);
+	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+
+	cfs_b->trace_status = status;
+	cfs_b->trace_active = false;
+	cfs_b->trace_ulim = false;
+
+	if (status)
+		cfs_b->trace_active = true;
+
+	return 0;
+}
+
+static s64 cpu_trace_period_bound_history_read_s64(struct cgroup_subsys_state *css,
+						   struct cftype *cft)
+{
+	return css_tg(css)->cfs_bandwidth.period_bound_history;
+}
+
+static int cpu_trace_period_bound_history_write_s64(struct cgroup_subsys_state *css,
+						    struct cftype *cft, s64 history)
+{
+	struct task_group *tg = css_tg(css);
+	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+
+	if (!history)
+		return -EINVAL;
+
+	cfs_b->pb_period_hist = krealloc(cfs_b->pb_period_hist, history * sizeof(u64), GFP_KERNEL);
+	cfs_b->pb_runtime_hist = krealloc(cfs_b->pb_runtime_hist, history * sizeof(u64), GFP_KERNEL);
+
+	if (!cfs_b->pb_period_hist || !cfs_b->pb_runtime_hist) {
+		pr_err("OOM: period bound history");
+		return -ENOMEM;
+	}
+
+	cfs_b->period_bound_history = history;
+
+	return 0;
+}
+
+static s64 cpu_trace_period_agnostic_history_read_s64(struct cgroup_subsys_state *css,
+						      struct cftype *cft)
+{
+	return css_tg(css)->cfs_bandwidth.period_agnostic_history;
+}
+
+static int cpu_trace_period_agnostic_history_write_s64(struct cgroup_subsys_state *css,
+						       struct cftype *cft, s64 history)
+{
+       struct task_group *tg = css_tg(css);
+       struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+       struct sched_entity_entry *entry;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(entry, &cfs_b->active_sched_entity, list_node) {
+		struct sched_entity *curr = entry->se;
+
+		curr->pa_yield_hist = krealloc(curr->pa_yield_hist, history * sizeof(u64), GFP_KERNEL);
+		curr->pa_runtime_hist = krealloc(curr->pa_runtime_hist, history * sizeof(u64), GFP_KERNEL);
+
+		if (!curr->pa_yield_hist || !curr->pa_runtime_hist) {
+			pr_err("OOM: period anogistic history");
+			return -ENOMEM;
+		}
+	}
+	rcu_read_unlock();
+
+	cfs_b->period_agnostic_history = history;
+
+	return 0;
+}
+
+static int cpu_trace_max_show(struct seq_file *sf, void *v)
+{
+       struct task_group *tg = css_tg(seq_css(sf));
+       u64 period_us, quota_us;
+
+       period_us = tg->cfs_bandwidth.recommender_period;
+       quota_us = tg->cfs_bandwidth.recommender_quota;
+
+       do_div(period_us, NSEC_PER_USEC);
+
+       if (quota_us != RUNTIME_INF)
+               do_div(quota_us, NSEC_PER_USEC);
+
+       cpu_period_quota_print(sf, period_us, quota_us);
+       return 0;
+}
+
 #endif
 
 static struct cftype cpu_files[] = {
@@ -9940,6 +10052,29 @@ static struct cftype cpu_files[] = {
 		.flags = CFTYPE_NOT_ON_ROOT,
 		.read_u64 = cpu_cfs_burst_read_u64,
 		.write_u64 = cpu_cfs_burst_write_u64,
+	},
+	{
+		.name = "trace.status",
+               .flags = CFTYPE_NOT_ON_ROOT,
+               .read_s64 = cpu_trace_status_read_s64,
+               .write_s64 = cpu_trace_status_write_s64,
+	},
+	{
+		.name = "trace.period_bound_history",
+               .flags = CFTYPE_NOT_ON_ROOT,
+               .read_s64 = cpu_trace_period_bound_history_read_s64,
+               .write_s64 = cpu_trace_period_bound_history_write_s64,
+	},
+	{
+		.name = "trace.period_agnostic_history",
+               .flags = CFTYPE_NOT_ON_ROOT,
+               .read_s64 = cpu_trace_period_agnostic_history_read_s64,
+               .write_s64 = cpu_trace_period_agnostic_history_write_s64,
+	},
+	{
+		.name = "trace.max",
+               .flags = CFTYPE_NOT_ON_ROOT,
+               .seq_show = cpu_trace_max_show,
 	},
 #endif
 #ifdef CONFIG_UCLAMP_TASK_GROUP
