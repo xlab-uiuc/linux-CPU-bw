@@ -38,6 +38,7 @@
 #include <linux/sched/isolation.h>
 #include <linux/sched/nohz.h>
 
+#include <linux/sort.h>
 #include <linux/cpuidle.h>
 #include <linux/interrupt.h>
 #include <linux/memory-tiers.h>
@@ -5768,6 +5769,12 @@ static inline struct cfs_bandwidth *tg_cfs_bandwidth(struct task_group *tg)
 	return &tg->cfs_bandwidth;
 }
 
+static int cmp_u64(const void *A, const void *B)
+{
+	const u64 *a = A, *b = B;
+	return *a - *b;
+}
+
 /* returns 0 on failure to allocate runtime */
 static int __assign_cfs_rq_runtime(struct cfs_bandwidth *cfs_b,
 				   struct cfs_rq *cfs_rq, u64 target_runtime)
@@ -6278,7 +6285,7 @@ next:
  */
 static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, unsigned long flags)
 {
-	int throttled;
+	int throttled, percentile_idx = 0;
 
 	/* no need to continue the timer with no bandwidth constraint */
 	if (cfs_b->quota == RUNTIME_INF)
@@ -6287,6 +6294,58 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, u
 	throttled = !list_empty(&cfs_b->throttled_cfs_rq);
 	cfs_b->nr_periods += overrun;
 
+	if (!cfs_b->trace_active || cfs_b->idle)
+		goto period_timer_out;
+	/*
+	 * Period bound tracing
+	 * Collect history of runtime information within a bound period set
+	 * by the cfs bandwidth scheduler
+	*/
+	cfs_b->pb_runtime_hist[cfs_b->pb_hist_idx] = cfs_b->quota - cfs_b->runtime;
+	cfs_b->pb_period_hist[cfs_b->pb_hist_idx] = cfs_b->period;
+	cfs_b->pb_hist_idx++;
+
+	/* Start crunching data only when the history is full */
+	if (cfs_b->pb_hist_idx < cfs_b->period_bound_history)
+		goto period_timer_out;
+
+	/* Find the 99P (worst case) from the history */
+	sort(cfs_b->pb_runtime_hist, cfs_b->period_bound_history, sizeof(u64), cmp_u64, NULL);
+	sort(cfs_b->pb_period_hist, cfs_b->period_bound_history, sizeof(u64), cmp_u64, NULL);
+
+	percentile_idx = DIV_ROUND_UP(99 * (cfs_b->period_bound_history - 1), 100);
+	cfs_b->pb_recommender_quota = cfs_b->pb_runtime_hist[percentile_idx];
+	cfs_b->pb_recommender_period = cfs_b->pb_period_hist[percentile_idx];
+	cfs_b->pb_cpu = DIV_ROUND_UP_ULL(cfs_b->pb_recommender_quota * 100000, cfs_b->pb_recommender_period);
+	trace_printk("[RECOMMEND BOUND] quota: %llu period: %llu millicpu: %llu\n",
+			cfs_b->pb_recommender_quota, cfs_b->pb_recommender_period, cfs_b->pb_cpu);
+
+	cfs_b->recommender_period = cfs_b->pb_recommender_period;
+	cfs_b->recommender_quota = cfs_b->pb_recommender_quota;
+
+	/*
+	 * Avoid stalls, the recommendation can never be lower than sched slice.
+	 * Overallocation by a little here is okay.
+	 */
+	if (cfs_b->recommender_period < sched_cfs_bandwidth_slice())
+		cfs_b->recommender_period += sched_cfs_bandwidth_slice();
+	if (cfs_b->recommender_quota < sched_cfs_bandwidth_slice())
+		cfs_b->recommender_quota += sched_cfs_bandwidth_slice();
+
+	if (cfs_b->pb_cpu) {
+		/* Apply the recommendation */
+		if (cfs_b->trace_status == 2) {
+			cfs_b->period = cfs_b->recommender_period;
+			cfs_b->quota = cfs_b->recommender_quota;
+		}
+	}
+
+	/* Clear the history after a recommendation */
+	cfs_b->pb_hist_idx = 0;
+	memset(cfs_b->pb_period_hist, 0, cfs_b->period_bound_history * sizeof(cfs_b->pb_period_hist));
+	memset(cfs_b->pb_runtime_hist, 0, cfs_b->period_bound_history * sizeof(cfs_b->pb_runtime_hist));
+
+period_timer_out:
 	/* Refill extra burst quota even if cfs_b->idle */
 	__refill_cfs_bandwidth_runtime(cfs_b);
 
