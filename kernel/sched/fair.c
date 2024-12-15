@@ -3662,9 +3662,17 @@ static inline void update_scan_period(struct task_struct *p, int new_cpu)
 
 #endif /* CONFIG_NUMA_BALANCING */
 
+static inline struct cfs_bandwidth *tg_cfs_bandwidth(struct task_group *tg)
+{
+	return &tg->cfs_bandwidth;
+}
+
 static void
 account_entity_enqueue(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
+	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
+	struct sched_entity_entry *entry;
+
 	update_load_add(&cfs_rq->load, se->load.weight);
 #ifdef CONFIG_SMP
 	if (entity_is_task(se)) {
@@ -3675,8 +3683,44 @@ account_entity_enqueue(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	}
 #endif
 	cfs_rq->nr_running++;
-	if (se_is_idle(se))
+	if (se_is_idle(se)) {
 		cfs_rq->idle_nr_running++;
+		return;
+	}
+
+	if (!cfs_b || !cfs_b->trace_active)
+		return;
+
+	/*
+	 * Add sched entity to the active list
+	 * The entity will not be added to the list if it already exists in the
+	 * list. This can happen as we do not remove entities on dequeue to ensure
+	 * that we don't have a clobbering of enqueue + dequeue operations within
+	 * the same period and can account for them effectively.
+	 *
+	*/
+	rcu_read_lock();
+	list_for_each_entry_rcu(entry, &cfs_b->active_sched_entity, list_node) {
+		/* Bail if we already have the entity */
+		if (entry->se == se) {
+			rcu_read_unlock();
+			return;
+		}
+	}
+	rcu_read_unlock();
+
+	/* Add the sched entity to the active list */
+	entry = kmalloc(sizeof(struct sched_entity_entry), GFP_KERNEL);
+	entry->se = se;
+	INIT_LIST_HEAD(&entry->list_node);
+	raw_spin_lock(&cfs_b->lock);
+	list_add_tail_rcu(&entry->list_node, &cfs_b->active_sched_entity);
+	cfs_b->num_se_active++;
+	raw_spin_unlock(&cfs_b->lock);
+
+	trace_printk("[ENQUEUE] se: 0x%llx num_active_se: %d\n",
+		     (u64) se,
+		     cfs_b->num_se_active);
 }
 
 static void
@@ -5764,11 +5808,6 @@ void __refill_cfs_bandwidth_runtime(struct cfs_bandwidth *cfs_b)
 	cfs_b->runtime_snap = cfs_b->runtime;
 }
 
-static inline struct cfs_bandwidth *tg_cfs_bandwidth(struct task_group *tg)
-{
-	return &tg->cfs_bandwidth;
-}
-
 static int cmp_u64(const void *A, const void *B)
 {
 	const u64 *a = A, *b = B;
@@ -6285,6 +6324,7 @@ next:
  */
 static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, unsigned long flags)
 {
+	struct sched_entity_entry *entry, *temp_entry;
 	int throttled, percentile_idx = 0;
 
 	/* no need to continue the timer with no bandwidth constraint */
@@ -6339,6 +6379,17 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, u
 			cfs_b->quota = cfs_b->recommender_quota;
 		}
 	}
+
+	/* Clear the active sched entity list periodically */
+	raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
+	raw_spin_lock(&cfs_b->lock);
+	list_for_each_entry_safe(entry, temp_entry, &cfs_b->active_sched_entity, list_node) {
+			list_del(&entry->list_node);
+			kfree(entry);
+	}
+	cfs_b->num_se_active = 0;
+	raw_spin_unlock(&cfs_b->lock);
+	raw_spin_lock_irqsave(&cfs_b->lock, flags);
 
 	/* Clear the history after a recommendation */
 	cfs_b->pb_hist_idx = 0;
@@ -6658,6 +6709,7 @@ void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b, struct cfs_bandwidth *paren
 	cfs_b->pb_period_hist = kmalloc(cfs_b->period_bound_history * sizeof(u64), GFP_KERNEL);
 	cfs_b->pb_hist_idx = 0;
 	cfs_b->pb_cpu = 0;
+	cfs_b->num_se_active = 0;
 
 	INIT_LIST_HEAD(&cfs_b->active_sched_entity);
 
