@@ -3718,9 +3718,23 @@ account_entity_enqueue(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	cfs_b->num_se_active++;
 	raw_spin_unlock(&cfs_b->lock);
 
-	trace_printk("[ENQUEUE] se: 0x%llx num_active_se: %d\n",
-		     (u64) se,
-		     cfs_b->num_se_active);
+	if (!se->PX_runtime || !se->PX_yield_time)
+		return;
+
+	if (cfs_b->num_se_active == 1) {
+		cfs_b->pa_recommender_quota = se->PX_runtime;
+		cfs_b->pa_cpu = se->pa_cpu;
+	} else {
+		cfs_b->pa_recommender_quota += se->PX_runtime;
+		cfs_b->pa_cpu += se->pa_cpu;
+	}
+
+	if (cfs_b->pa_cpu)
+		cfs_b->pa_recommender_period = DIV_ROUND_UP_ULL(cfs_b->pa_recommender_quota * 100000, cfs_b->pa_cpu);
+
+	trace_printk("[ENQUEUE] se: 0x%llx num_active_se: %d quota: %llu period: %llu millicpu: %llu\n",
+		     (u64) se, cfs_b->num_se_active, cfs_b->pa_recommender_quota, cfs_b->pa_recommender_period, cfs_b->pa_cpu);
+
 }
 
 static void
@@ -5814,11 +5828,160 @@ static int cmp_u64(const void *A, const void *B)
 	return *a - *b;
 }
 
+/*
+ * Period agnostic tracing and recommendation
+ *
+ * The core idea is to trace an enitity's runtime beyond the confines of the
+ * bandwidth period it is bound to. Application may yeild as they please and
+ * the goal is to track when an sched enity yeilds to determine how long it
+ * actually ran for
+ *
+ * The problem however is that a queue can yeild for a variety of reasons with
+ * the exipry of sched_cfs_bandwidth_slice being the most common of them all
+ * only for them to be rescheduled back as the application originally intended.
+ *
+ * Therefore, we devise a methodology to track the time application and yeilded
+ * for external to that of the bandwidth timer and identify a self-yeild when it
+ * is greater than the slice it was given.
+ *
+ * Yield clock mechanism -
+ * The yield clock always runs alongside with runtime clock.
+ * When a self-yield is found, the runtime and other correctional
+ * times are subtracted from it.
+ * The yield clock is not primed if it had already been before. This can
+ * happen when a yield has occured but it was only due to the expiry of
+ * the sched_slice and was scheduled again not because of a self-yield.
+ *
+ * Self-yield or legimiate yield -
+ * A yield that likely occured by it's own accord rather than external
+ * reasons. For all other reasons, the task is likely to be scheduled
+ * again soon and capturing those may not reflect the task's true
+ * runtime nature.
+ * We classify a self-yield mainly if the yield time duration was
+ * greater than the last target runtime (mostly the sched slice).
+ * This means that it was not immediately rescheduled
+ *
+ * Returns: ready-to-recommend - if the current history collected is enough
+ * and if there was a legitimate yeild prior to it.
+ */
+static bool period_agnostic_trace(struct cfs_bandwidth *cfs_b,
+				  struct cfs_rq *cfs_rq,
+				  u64 target_runtime)
+{
+	struct sched_entity *se = cfs_rq->curr;
+	struct rq *rq = rq_of(cfs_rq);
+	bool legit_yield = false;
+	u64 curr_yield_time = 0;
+	s64 yield_time, runtime;
+
+	/*
+	 * The rq is currently not running on anything.
+	 * It is both a sanity check as well as to fend off against potential
+	 * races if the rq was previously running and isn't anymore.
+	 */
+	if (!se)
+		return 0;
+
+	if (se->yield_time_start)
+		curr_yield_time = rq_clock(rq) - se->yield_time_start;
+
+	/* Can be -ve if curr_yield_time doesn't exist. Hence signed */
+	yield_time = curr_yield_time - se->prev_runtime;
+
+	/*
+	 * A legitimate Self-yield found. calculate how long we ran for and
+	 * record the run-yield information within the enitity's history
+	 */
+	if (curr_yield_time && se->runtime_start &&
+	    yield_time > (s64) target_runtime) {
+		legit_yield = true;
+		/* use curr_yield - No need to subtract prev_runtime */
+		runtime = rq_clock(rq) - se->runtime_start - curr_yield_time;
+		if (runtime <= 0)
+			goto reset_runtime;
+
+		/* Wrap around history */
+		se->pa_hist_idx %= cfs_b->period_agnostic_history;
+		se->pa_yield_hist[se->pa_hist_idx] = yield_time;
+		se->pa_runtime_hist[se->pa_hist_idx] = runtime;
+		se->pa_hist_idx++;
+
+		trace_printk("[TRACE AGNOS] se: 0x%llx yield: %llu runtime: %llu\n",
+			     (u64) se, yield_time, runtime);
+reset_runtime:
+		se->runtime_start = 0;
+	}
+
+	/*
+	 * Reprime the clocks.
+	 *
+	 * Yield clock - always reprimed as it has freshly come off a yield
+	 * in this function
+	 *
+	 * Runtime clock - only reprimed if it is the first time we have entered
+	 * the trace. Or, when a come off a legitimate self-yield and have just
+	 * recorded the runtime duration.
+	 */
+
+	se->yield_time_start = rq_clock(rq);
+	if (!se->runtime_start)
+		se->runtime_start = rq_clock(rq);
+
+	/*
+	 * This ensures that at least one sched entity is ready to go and
+	 * has just seen a legitimate yeild
+	 */
+	return (se->pa_hist_idx >= cfs_b->period_agnostic_history - 1) && legit_yield;
+}
+
+static void period_agnostic_recommend(struct cfs_bandwidth *cfs_b)
+{
+	int percentile_idx = 0, num_se = 0;
+	struct sched_entity_entry *entry;
+
+	cfs_b->pa_recommender_quota = 0;
+	cfs_b->pa_recommender_period = 0;
+	cfs_b->pa_cpu = 0;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(entry, &cfs_b->active_sched_entity, list_node) {
+		struct sched_entity *temp_se = entry->se;
+
+		/* Sanity size check*/
+		if (temp_se->pa_hist_idx <= 0)
+			continue;
+
+		sort(temp_se->pa_runtime_hist, temp_se->pa_hist_idx, sizeof(u64), cmp_u64, NULL);
+		sort(temp_se->pa_yield_hist, temp_se->pa_hist_idx, sizeof(u64), cmp_u64, NULL);
+		percentile_idx = DIV_ROUND_UP(99 * (temp_se->pa_hist_idx - 1), 100);
+		temp_se->PX_runtime = temp_se->pa_runtime_hist[percentile_idx];
+		temp_se->PX_yield_time = temp_se->pa_yield_hist[percentile_idx];
+
+		/* Runtimes are added and CPU calculated */
+		cfs_b->pa_recommender_quota += temp_se->PX_runtime;
+		if (temp_se->PX_runtime + temp_se->PX_yield_time) {
+			temp_se->pa_cpu = DIV_ROUND_UP_ULL(temp_se->PX_runtime * 100000,
+							   temp_se->PX_runtime + temp_se->PX_yield_time);
+			cfs_b->pa_cpu += temp_se->pa_cpu;
+		}
+
+		num_se++;
+	}
+	rcu_read_unlock();
+
+	if (cfs_b->pa_cpu)
+		cfs_b->pa_recommender_period = DIV_ROUND_UP_ULL(cfs_b->pa_recommender_quota * 100000, cfs_b->pa_cpu);
+
+	trace_printk("[RECOMMEND AGNOS] quota: %llu period: %llu millicpu: %llu num_se= %d\n",
+		cfs_b->pa_recommender_quota, cfs_b->pa_recommender_period, cfs_b->pa_cpu, num_se);
+}
+
 /* returns 0 on failure to allocate runtime */
 static int __assign_cfs_rq_runtime(struct cfs_bandwidth *cfs_b,
 				   struct cfs_rq *cfs_rq, u64 target_runtime)
 {
 	u64 min_amount, amount = 0;
+	bool ready_to_recommend;
 
 	lockdep_assert_held(&cfs_b->lock);
 
@@ -5828,6 +5991,11 @@ static int __assign_cfs_rq_runtime(struct cfs_bandwidth *cfs_b,
 	if (cfs_b->quota == RUNTIME_INF)
 		amount = min_amount;
 	else {
+		if (cfs_b->trace_active) {
+			ready_to_recommend = period_agnostic_trace(cfs_b, cfs_rq, target_runtime);
+			if (ready_to_recommend)
+				period_agnostic_recommend(cfs_b);
+		}
 		start_cfs_bandwidth(cfs_b);
 
 		if (cfs_b->runtime > 0) {
@@ -5835,6 +6003,9 @@ static int __assign_cfs_rq_runtime(struct cfs_bandwidth *cfs_b,
 			cfs_b->runtime -= amount;
 			cfs_b->idle = 0;
 		}
+
+		if (cfs_b->trace_active && cfs_rq->curr)
+			cfs_rq->curr->prev_runtime = amount;
 	}
 
 	cfs_rq->runtime_remaining += amount;
@@ -6316,6 +6487,20 @@ next:
 	return throttled;
 }
 
+static bool similar(u64 n1, u64 n2, u64 similarity)
+{
+	u64 n3 = 0;
+
+	if (n1 > n2)
+		n3 = n1 - n2;
+	else
+		n3 = n2 - n1;
+
+	if (n3 < similarity)
+		return true;
+	return false;
+}
+
 /*
  * Responsible for refilling a task_group's bandwidth and unthrottling its
  * cfs_rqs as appropriate. If there has been no activity within the last
@@ -6363,6 +6548,20 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, u
 	cfs_b->recommender_period = cfs_b->pb_recommender_period;
 	cfs_b->recommender_quota = cfs_b->pb_recommender_quota;
 
+	if (cfs_b->pb_cpu && cfs_b->pa_cpu) {
+		if (cfs_b->pb_cpu > cfs_b->pa_cpu ||
+		    similar(cfs_b->pb_cpu, cfs_b->pa_cpu, 25000)) {
+			cfs_b->recommender_period = cfs_b->pa_recommender_period;
+			cfs_b->recommender_quota = cfs_b->pa_recommender_quota;
+		}
+		/* If the quota is similar - choose the higher period - aka lower CPUs*/
+		if (similar(cfs_b->pb_recommender_quota, cfs_b->pa_recommender_quota, 10000000))
+			cfs_b->recommender_period = max(cfs_b->pb_recommender_period, cfs_b->pa_recommender_period);
+	} else if (cfs_b->pa_cpu) {
+		cfs_b->recommender_period = cfs_b->pa_recommender_period;
+		cfs_b->recommender_quota = cfs_b->pa_recommender_quota;
+	}
+
 	/*
 	 * Avoid stalls, the recommendation can never be lower than sched slice.
 	 * Overallocation by a little here is okay.
@@ -6372,13 +6571,14 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, u
 	if (cfs_b->recommender_quota < sched_cfs_bandwidth_slice())
 		cfs_b->recommender_quota += sched_cfs_bandwidth_slice();
 
-	if (cfs_b->pb_cpu) {
-		/* Apply the recommendation */
-		if (cfs_b->trace_status == 2) {
-			cfs_b->period = cfs_b->recommender_period;
-			cfs_b->quota = cfs_b->recommender_quota;
-		}
+	/* Apply the recommendation */
+	if (cfs_b->recommender_period && cfs_b->recommender_quota && cfs_b->trace_status == 2) {
+		cfs_b->period = cfs_b->recommender_period;
+		cfs_b->quota = cfs_b->recommender_quota;
 	}
+
+	trace_printk("[RECOMMEND FINAL] quota: %llu period: %llu\n",
+		     cfs_b->recommender_quota, cfs_b->recommender_period);
 
 	/* Clear the active sched entity list periodically */
 	raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
@@ -6396,6 +6596,11 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, u
 	memset(cfs_b->pb_period_hist, 0, cfs_b->period_bound_history * sizeof(cfs_b->pb_period_hist));
 	memset(cfs_b->pb_runtime_hist, 0, cfs_b->period_bound_history * sizeof(cfs_b->pb_runtime_hist));
 
+	cfs_b->num_se_active = 0;
+	cfs_b->pa_recommender_quota = 0;
+	cfs_b->pa_recommender_period = 0;
+	memset(cfs_b->pb_period_hist, 0, cfs_b->period_agnostic_history * sizeof(cfs_b->pb_period_hist));
+	memset(cfs_b->pb_runtime_hist, 0, cfs_b->period_agnostic_history * sizeof(cfs_b->pb_runtime_hist));
 period_timer_out:
 	/* Refill extra burst quota even if cfs_b->idle */
 	__refill_cfs_bandwidth_runtime(cfs_b);
@@ -6717,6 +6922,7 @@ void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b, struct cfs_bandwidth *paren
 	cfs_b->pa_recommender_quota = 0;
 	cfs_b->pb_recommender_period = 0;
 	cfs_b->pb_recommender_quota = 0;
+	cfs_b->pa_cpu = 0;
 	cfs_b->recommender_period = ns_to_ktime(default_cfs_period());;
 	cfs_b->recommender_quota = RUNTIME_INF;
 }

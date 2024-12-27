@@ -449,6 +449,7 @@ struct cfs_bandwidth {
 	/* Most of it stored in sched_entities */
 	struct list_head	active_sched_entity;
 	int			num_se_active;
+	u64			pa_cpu;
 
 	/*** Recommendations ***/
 	u64			pa_recommender_period;

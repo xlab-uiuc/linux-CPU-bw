@@ -4455,6 +4455,12 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 	p->se.pa_cpu = 0;
 	p->se.pa_yield_hist = kmalloc(cfs_b->period_agnostic_history * sizeof(u64), GFP_KERNEL);
 	p->se.pa_runtime_hist = kmalloc(cfs_b->period_agnostic_history * sizeof(u64), GFP_KERNEL);
+
+	p->se.yield_time_start = 0;
+	p->se.runtime_start = 0;
+	p->se.prev_runtime = 0;
+	p->se.PX_yield_time = 0;
+	p->se.PX_runtime = 0;
 #endif /* CONFIG_CFS_BANDWIDTH */
 #endif
 

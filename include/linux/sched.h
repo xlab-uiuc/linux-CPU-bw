@@ -586,6 +586,14 @@ struct sched_entity {
 	u64 *pa_yield_hist;
 	u64 *pa_runtime_hist;
 	u64 pa_cpu;
+
+	/* period agnostic helpers */
+	u64 yield_time_start;
+	u64 runtime_start;
+	u64 prev_runtime;
+	u64 PX_yield_time;
+	u64 PX_runtime;
+
 #endif /* CONFIG_CFS_BANDWIDTH */
 #endif
 
