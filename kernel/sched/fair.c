@@ -3710,15 +3710,21 @@ account_entity_enqueue(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	rcu_read_unlock();
 
 	/* Add the sched entity to the active list */
-	entry = kmalloc(sizeof(struct sched_entity_entry), GFP_KERNEL);
-	entry->se = se;
-	INIT_LIST_HEAD(&entry->list_node);
-	raw_spin_lock(&cfs_b->lock);
-	list_add_tail_rcu(&entry->list_node, &cfs_b->active_sched_entity);
-	cfs_b->num_se_active++;
+	/* Check for se to not be NULL - sanity check */
+	if (se) {
+		entry = kmalloc(sizeof(struct sched_entity_entry), GFP_KERNEL);
+		entry->se = se;
+		INIT_LIST_HEAD(&entry->list_node);
+		raw_spin_lock(&cfs_b->lock);
+		list_add_tail_rcu(&entry->list_node, &cfs_b->active_sched_entity);
+		cfs_b->num_se_active++;
+	} else {
+		trace_printk("[ENQUEUE] se is NULL. Active list not appened.");
+	}
+
 	raw_spin_unlock(&cfs_b->lock);
 
-	if (!se->PX_runtime || !se->PX_yield_time)
+	if (!se || !se->PX_runtime || !se->PX_yield_time)
 		return;
 
 	if (cfs_b->num_se_active == 1) {
@@ -5946,6 +5952,12 @@ static void period_agnostic_recommend(struct cfs_bandwidth *cfs_b)
 	rcu_read_lock();
 	list_for_each_entry_rcu(entry, &cfs_b->active_sched_entity, list_node) {
 		struct sched_entity *temp_se = entry->se;
+
+		/* Skip se if NULL - most likely it idle now - root-cause later */
+		if (!temp_se) {
+			trace_printk("[RECOMMEND] sched entity is NULL\n");
+			continue;
+		}
 
 		/* Sanity size check*/
 		if (temp_se->pa_hist_idx <= 0)
