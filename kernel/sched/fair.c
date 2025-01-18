@@ -6250,6 +6250,7 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
 	struct sched_entity *se;
 	long task_delta, idle_task_delta;
+	u64 curr_throttle_time;
 	long rq_h_nr_running = rq->cfs.h_nr_running;
 
 	se = cfs_rq->tg->se[cpu_of(rq)];
@@ -6260,7 +6261,8 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 
 	raw_spin_lock(&cfs_b->lock);
 	if (cfs_rq->throttled_clock) {
-		cfs_b->throttled_time += rq_clock(rq) - cfs_rq->throttled_clock;
+		curr_throttle_time = rq_clock(rq) - cfs_rq->throttled_clock;
+		cfs_b->throttled_time += curr_throttle_time;
 		cfs_rq->throttled_clock = 0;
 	}
 	list_del_rcu(&cfs_rq->throttled_list);
@@ -6295,6 +6297,17 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 			dequeue_entity(qcfs_rq, se, flags);
 		} else if (se->on_rq)
 			break;
+
+		/* Wind the se clock forward before we enqueue */
+		if (cfs_b->trace_active && se->runtime_start && se->yield_time_start) {
+			se->runtime_start += curr_throttle_time;
+			se->yield_time_start += curr_throttle_time;
+			#if 1
+			trace_printk("[UNTHROTTLE] se: 0x%llx, curr_throttle: %llu, runtime_start: %llu yield_start: %llu\n",
+				     (u64)se, curr_throttle_time, se->runtime_start, se->yield_time_start);
+			#endif
+		}
+
 		enqueue_entity(qcfs_rq, se, ENQUEUE_WAKEUP);
 
 		if (cfs_rq_is_idle(group_cfs_rq(se)))
