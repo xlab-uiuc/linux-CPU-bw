@@ -6609,8 +6609,11 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, u
 	raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
 	raw_spin_lock(&cfs_b->lock);
 	list_for_each_entry_safe(entry, temp_entry, &cfs_b->active_sched_entity, list_node) {
-			list_del(&entry->list_node);
-			kfree(entry);
+		entry->se->runtime_start = 0;
+		entry->se->yield_time_start = 0;
+		entry->se->prev_runtime = 0;
+		list_del(&entry->list_node);
+		kfree(entry);
 	}
 	cfs_b->num_se_active = 0;
 	raw_spin_unlock(&cfs_b->lock);
