@@ -438,6 +438,10 @@ struct cfs_bandwidth {
 	 */
 	int period_bound_history;
 	int period_agnostic_history;
+	int throttle_threshold;
+	int num_scaling_period;
+	int scale_up_factor;
+	int scale_down_factor;
 
 	/*** Period bound history ***/
 	int pb_hist_idx;
@@ -469,6 +473,8 @@ struct cfs_bandwidth {
 	bool trace_active;
 	/* Trace unlimited invoked for a short duration during high degrees of throttle */
 	bool trace_ulim;
+	int curr_throttle;
+	int curr_scaling_interval;
 
 	/* Statistics: */
 	int			nr_periods;

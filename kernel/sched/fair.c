@@ -6546,6 +6546,18 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, u
 
 	if (!cfs_b->trace_active || cfs_b->idle)
 		goto period_timer_out;
+
+	/* Count up consecutive throttles. Reset the count when streak is broken */
+	if (throttled)
+		cfs_b->curr_throttle++;
+	else
+		cfs_b->curr_throttle = 0;
+
+	if (cfs_b->curr_throttle >= cfs_b->throttle_threshold) {
+		cfs_b->trace_ulim = true;
+		goto period_timer_out;
+	}
+
 	/*
 	 * Period bound tracing
 	 * Collect history of runtime information within a bound period set
@@ -6630,6 +6642,63 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, u
 	memset(cfs_b->pb_period_hist, 0, cfs_b->period_agnostic_history * sizeof(cfs_b->pb_period_hist));
 	memset(cfs_b->pb_runtime_hist, 0, cfs_b->period_agnostic_history * sizeof(cfs_b->pb_runtime_hist));
 period_timer_out:
+	if (!cfs_b->trace_ulim)
+		goto ulim_out;
+
+	/* Exponential tracing:
+	 * When the throttle is too high, exponential tracing is invoked.
+	 * The recommendations are disabled and the quota is scaled up.
+	 * The quota doubles when we continue to see throttling and halfved when
+	 * we stop. After the interval ends, regular tracing is resumed.
+	 */
+	cfs_b->curr_scaling_interval++;
+	if (cfs_b->curr_scaling_interval < cfs_b->num_scaling_period) {
+		cfs_b->trace_active = false;
+		/* If we continue to be throttle scale up further else scale down */
+		if (throttled) {
+			cfs_b->quota = min((unsigned long long)ns_to_ktime(num_online_cpus() * default_cfs_period()), cfs_b->quota * cfs_b->scale_up_factor);
+		}
+		else {
+			// Even on no throttle, max just go down to half a CPU.
+			cfs_b->quota = max((unsigned long long)50000, cfs_b->quota / cfs_b->scale_up_factor);
+		}
+		// cfs_b->quota = ns_to_ktime(num_online_cpus() * default_cfs_period());
+
+		if (cfs_b->recommender_period)
+			cfs_b->period = cfs_b->recommender_period;
+		else
+			cfs_b->period = ns_to_ktime(default_cfs_period());
+
+		#if 1
+		trace_printk("[ULIM] curr_interval: %d quota: %llu period: %llu\n",
+			      cfs_b->curr_scaling_interval, cfs_b->quota, cfs_b->period);
+		#endif
+	} else {
+		cfs_b->trace_ulim = false;
+		cfs_b->curr_scaling_interval = 0;
+		cfs_b->trace_active = true;
+
+		/* Clear the past observations */
+		cfs_b->recommender_period = 0;
+		cfs_b->recommender_quota = 0;
+		raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
+		raw_spin_lock(&cfs_b->lock);
+		list_for_each_entry_safe(entry, temp_entry, &cfs_b->active_sched_entity, list_node) {
+			entry->se->runtime_start = 0;
+			entry->se->yield_time_start = 0;
+			entry->se->prev_runtime = 0;
+			entry->se->PX_yield_time = 0;
+			entry->se->PX_runtime = 0;
+			entry->se->pa_cpu = 0;
+			// list_del(&entry->list_node);
+			// kfree(entry);
+		}
+		cfs_b->num_se_active = 0;
+		raw_spin_unlock(&cfs_b->lock);
+		raw_spin_lock_irqsave(&cfs_b->lock, flags);
+	}
+ulim_out:
+
 	/* Refill extra burst quota even if cfs_b->idle */
 	__refill_cfs_bandwidth_runtime(cfs_b);
 
@@ -6953,6 +7022,15 @@ void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b, struct cfs_bandwidth *paren
 	cfs_b->pa_cpu = 0;
 	cfs_b->recommender_period = ns_to_ktime(default_cfs_period());;
 	cfs_b->recommender_quota = RUNTIME_INF;
+
+	/* Throttle scaling init */
+	cfs_b->curr_throttle = 0;
+	cfs_b->curr_scaling_interval = 0;
+
+	cfs_b->throttle_threshold = 2;
+	cfs_b->num_scaling_period = 5;
+	cfs_b->scale_up_factor = 4;
+	cfs_b->scale_down_factor = 2;
 }
 
 static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq)

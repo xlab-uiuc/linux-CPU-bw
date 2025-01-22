@@ -10006,6 +10006,87 @@ static int cpu_trace_period_agnostic_history_write_s64(struct cgroup_subsys_stat
 	return 0;
 }
 
+
+static s64 cpu_trace_throttle_threshold_read_s64(struct cgroup_subsys_state *css,
+						 struct cftype *cft)
+{
+	return css_tg(css)->cfs_bandwidth.throttle_threshold;
+}
+
+static int cpu_trace_throttle_threshold_write_s64(struct cgroup_subsys_state *css,
+						  struct cftype *cft, s64 threshold)
+{
+	struct task_group *tg = css_tg(css);
+	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+
+	if (!threshold)
+		return -EINVAL;
+
+	cfs_b->throttle_threshold = threshold;
+
+	return 0;
+}
+
+static s64 cpu_trace_num_scaling_period_read_s64(struct cgroup_subsys_state *css,
+						 struct cftype *cft)
+{
+	return css_tg(css)->cfs_bandwidth.num_scaling_period;
+}
+
+static int cpu_trace_num_scaling_period_write_s64(struct cgroup_subsys_state *css,
+						  struct cftype *cft, s64 num_periods)
+{
+	struct task_group *tg = css_tg(css);
+	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+
+	if (!num_periods)
+		return -EINVAL;
+
+	cfs_b->num_scaling_period = num_periods;
+
+	return 0;
+}
+
+static s64 cpu_trace_scale_up_factor_read_s64(struct cgroup_subsys_state *css,
+						 struct cftype *cft)
+{
+	return css_tg(css)->cfs_bandwidth.scale_up_factor;
+}
+
+static int cpu_trace_scale_up_factor_write_s64(struct cgroup_subsys_state *css,
+						  struct cftype *cft, s64 factor)
+{
+	struct task_group *tg = css_tg(css);
+	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+
+	if (!factor)
+		return -EINVAL;
+
+	cfs_b->scale_up_factor = factor;
+
+	return 0;
+}
+
+static s64 cpu_trace_scale_down_factor_read_s64(struct cgroup_subsys_state *css,
+						 struct cftype *cft)
+{
+	return css_tg(css)->cfs_bandwidth.scale_down_factor;
+}
+
+static int cpu_trace_scale_down_factor_write_s64(struct cgroup_subsys_state *css,
+						  struct cftype *cft, s64 factor)
+{
+	struct task_group *tg = css_tg(css);
+	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+
+	if (!factor)
+		return -EINVAL;
+
+	cfs_b->scale_down_factor = factor;
+
+	return 0;
+}
+
 static int cpu_trace_max_show(struct seq_file *sf, void *v)
 {
        struct task_group *tg = css_tg(seq_css(sf));
@@ -10081,6 +10162,32 @@ static struct cftype cpu_files[] = {
 		.name = "trace.max",
                .flags = CFTYPE_NOT_ON_ROOT,
                .seq_show = cpu_trace_max_show,
+	},
+
+	/* Scaler debug interfaces */
+	{
+		.name = "trace.debug.throttle_threshold",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.read_s64 = cpu_trace_throttle_threshold_read_s64,
+		.write_s64 = cpu_trace_throttle_threshold_write_s64,
+	},
+	{
+		.name = "trace.debug.num_scaling_period",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.read_s64 = cpu_trace_num_scaling_period_read_s64,
+		.write_s64 = cpu_trace_num_scaling_period_write_s64,
+	},
+	{
+		.name = "trace.debug.scale_up_factor",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.read_s64 = cpu_trace_scale_up_factor_read_s64,
+		.write_s64 = cpu_trace_scale_up_factor_write_s64,
+	},
+		{
+		.name = "trace.debug.scale_down_factor",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.read_s64 = cpu_trace_scale_down_factor_read_s64,
+		.write_s64 = cpu_trace_scale_down_factor_write_s64,
 	},
 #endif
 #ifdef CONFIG_UCLAMP_TASK_GROUP
