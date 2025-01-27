@@ -9913,12 +9913,19 @@ static ssize_t cpu_max_write(struct kernfs_open_file *of,
 			     char *buf, size_t nbytes, loff_t off)
 {
 	struct task_group *tg = css_tg(of_css(of));
+	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
 	u64 period = tg_get_cfs_period(tg);
 	u64 burst = tg->cfs_bandwidth.burst;
 	u64 quota;
 	int ret;
 
 	ret = cpu_period_quota_parse(buf, &period, &quota);
+	if (quota == RUNTIME_INF) {
+		cfs_b->trace_status = 0;
+		cfs_b->trace_active = false;
+		cfs_b->trace_ulim = false;
+	}
+
 	if (!ret)
 		ret = tg_set_cfs_bandwidth(tg, period, quota, burst);
 	return ret ?: nbytes;
@@ -9940,7 +9947,7 @@ static int cpu_trace_status_write_s64(struct cgroup_subsys_state *css,
 	cfs_b->trace_active = false;
 	cfs_b->trace_ulim = false;
 
-	if (status)
+	if (status && cfs_b->quota != RUNTIME_INF)
 		cfs_b->trace_active = true;
 
 	return 0;
