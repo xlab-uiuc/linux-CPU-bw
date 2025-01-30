@@ -56,6 +56,11 @@
 #include "stats.h"
 #include "autogroup.h"
 
+#define CREATE_TRACE_POINTS
+#include <trace/events/kscaler.h>
+
+#define KSCALER_DEBUG 0
+
 /*
  * The initial- and re-scaling of tunables is configurable
  *
@@ -3738,9 +3743,7 @@ account_entity_enqueue(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	if (cfs_b->pa_cpu)
 		cfs_b->pa_recommender_period = DIV_ROUND_UP_ULL(cfs_b->pa_recommender_quota * 100000, cfs_b->pa_cpu);
 
-	trace_printk("[ENQUEUE] se: 0x%llx num_active_se: %d quota: %llu period: %llu millicpu: %llu\n",
-		     (u64) se, cfs_b->num_se_active, cfs_b->pa_recommender_quota, cfs_b->pa_recommender_period, cfs_b->pa_cpu);
-
+	trace_kscaler_se_enqueue(se, cfs_b->num_se_active);
 }
 
 static void
@@ -5912,8 +5915,7 @@ static bool period_agnostic_trace(struct cfs_bandwidth *cfs_b,
 		se->pa_runtime_hist[se->pa_hist_idx] = runtime;
 		se->pa_hist_idx++;
 
-		trace_printk("[TRACE AGNOS] se: 0x%llx yield: %llu runtime: %llu\n",
-			     (u64) se, yield_time, runtime);
+		trace_kscaler_agnostic_ind_record(se, runtime, yield_time);
 reset_runtime:
 		se->runtime_start = 0;
 	}
@@ -5949,6 +5951,22 @@ static void period_agnostic_recommend(struct cfs_bandwidth *cfs_b)
 	cfs_b->pa_recommender_period = 0;
 	cfs_b->pa_cpu = 0;
 
+	int idx = 0;
+	u64 *last_runtime, *last_yieldtime;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(entry, &cfs_b->active_sched_entity, list_node) {
+		num_se++;
+	}
+	rcu_read_unlock();
+
+	last_runtime = kmalloc(num_se * sizeof(u64), GFP_KERNEL);
+	last_yieldtime = kmalloc(num_se * sizeof(u64), GFP_KERNEL);
+	if (!last_runtime || !last_yieldtime) {
+		pr_err("Unable to allocate memory");
+		return;
+	}
+
 	rcu_read_lock();
 	list_for_each_entry_rcu(entry, &cfs_b->active_sched_entity, list_node) {
 		struct sched_entity *temp_se = entry->se;
@@ -5963,11 +5981,19 @@ static void period_agnostic_recommend(struct cfs_bandwidth *cfs_b)
 		if (temp_se->pa_hist_idx <= 0)
 			continue;
 
+		/* Record all se's most recent observation */
+		last_runtime[idx] = temp_se->pa_runtime_hist[temp_se->pa_hist_idx - 1];
+		last_yieldtime[idx] = temp_se->pa_yield_hist[temp_se->pa_hist_idx - 1];
+		idx++;
+
+		trace_kscaler_agnostic_record(temp_se);
+
 		sort(temp_se->pa_runtime_hist, temp_se->pa_hist_idx, sizeof(u64), cmp_u64, NULL);
 		sort(temp_se->pa_yield_hist, temp_se->pa_hist_idx, sizeof(u64), cmp_u64, NULL);
 		percentile_idx = DIV_ROUND_UP(99 * (temp_se->pa_hist_idx - 1), 100);
 		temp_se->PX_runtime = temp_se->pa_runtime_hist[percentile_idx];
 		temp_se->PX_yield_time = temp_se->pa_yield_hist[percentile_idx];
+
 
 		/* Runtimes are added and CPU calculated */
 		cfs_b->pa_recommender_quota += temp_se->PX_runtime;
@@ -5977,15 +6003,18 @@ static void period_agnostic_recommend(struct cfs_bandwidth *cfs_b)
 			cfs_b->pa_cpu += temp_se->pa_cpu;
 		}
 
-		num_se++;
 	}
 	rcu_read_unlock();
+
+	trace_kscaler_agnostic_se_record(last_runtime, last_yieldtime, num_se);
 
 	if (cfs_b->pa_cpu)
 		cfs_b->pa_recommender_period = DIV_ROUND_UP_ULL(cfs_b->pa_recommender_quota * 100000, cfs_b->pa_cpu);
 
-	trace_printk("[RECOMMEND AGNOS] quota: %llu period: %llu millicpu: %llu num_se= %d\n",
-		cfs_b->pa_recommender_quota, cfs_b->pa_recommender_period, cfs_b->pa_cpu, num_se);
+	trace_kscaler_agnostic_recommendation(cfs_b->pa_recommender_quota, cfs_b->pa_recommender_period);
+
+	kfree(last_runtime);
+	kfree(last_yieldtime);
 }
 
 /* returns 0 on failure to allocate runtime */
@@ -6302,7 +6331,7 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 		if (cfs_b->trace_active && se->runtime_start && se->yield_time_start) {
 			se->runtime_start += curr_throttle_time;
 			se->yield_time_start += curr_throttle_time;
-			#if 1
+			#if KSCALER_DEBUG
 			trace_printk("[UNTHROTTLE] se: 0x%llx, curr_throttle: %llu, runtime_start: %llu yield_start: %llu\n",
 				     (u64)se, curr_throttle_time, se->runtime_start, se->yield_time_start);
 			#endif
@@ -6565,6 +6594,8 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, u
 	*/
 	cfs_b->pb_runtime_hist[cfs_b->pb_hist_idx] = cfs_b->quota - cfs_b->runtime;
 	cfs_b->pb_period_hist[cfs_b->pb_hist_idx] = cfs_b->period;
+	trace_kscaler_bound_record(cfs_b->pb_runtime_hist[cfs_b->pb_hist_idx],
+				   cfs_b->pb_period_hist[cfs_b->pb_hist_idx] - cfs_b->pb_runtime_hist[cfs_b->pb_hist_idx]);
 	cfs_b->pb_hist_idx++;
 
 	/* Start crunching data only when the history is full */
@@ -6579,8 +6610,7 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, u
 	cfs_b->pb_recommender_quota = cfs_b->pb_runtime_hist[percentile_idx];
 	cfs_b->pb_recommender_period = cfs_b->pb_period_hist[percentile_idx];
 	cfs_b->pb_cpu = DIV_ROUND_UP_ULL(cfs_b->pb_recommender_quota * 100000, cfs_b->pb_recommender_period);
-	trace_printk("[RECOMMEND BOUND] quota: %llu period: %llu millicpu: %llu\n",
-			cfs_b->pb_recommender_quota, cfs_b->pb_recommender_period, cfs_b->pb_cpu);
+	trace_kscaler_bound_recommendation(cfs_b->pb_recommender_quota, cfs_b->pb_recommender_period);
 
 	cfs_b->recommender_period = cfs_b->pb_recommender_period;
 	cfs_b->recommender_quota = cfs_b->pb_recommender_quota;
@@ -6614,8 +6644,7 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, u
 		cfs_b->quota = cfs_b->recommender_quota;
 	}
 
-	trace_printk("[RECOMMEND FINAL] quota: %llu period: %llu\n",
-		     cfs_b->recommender_quota, cfs_b->recommender_period);
+	trace_kscaler_recommendation(cfs_b->recommender_quota, cfs_b->recommender_period);
 
 	/* Clear the active sched entity list periodically */
 	raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
@@ -6669,7 +6698,7 @@ period_timer_out:
 		else
 			cfs_b->period = ns_to_ktime(default_cfs_period());
 
-		#if 1
+		#if KSCALER_DEBUG
 		trace_printk("[ULIM] curr_interval: %d quota: %llu period: %llu\n",
 			      cfs_b->curr_scaling_interval, cfs_b->quota, cfs_b->period);
 		#endif

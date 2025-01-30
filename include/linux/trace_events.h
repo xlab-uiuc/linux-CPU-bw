@@ -49,6 +49,10 @@ const char *trace_print_array_seq(struct trace_seq *p,
 				   const void *buf, int count,
 				   size_t el_size);
 
+const char *trace_print_array_seq_int(struct trace_seq *p,
+				   const void *buf, int count,
+				   size_t el_size);
+
 const char *
 trace_print_hex_dump_seq(struct trace_seq *p, const char *prefix_str,
 			 int prefix_type, int rowsize, int groupsize,
