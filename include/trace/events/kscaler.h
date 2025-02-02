@@ -128,7 +128,7 @@ DEFINE_EVENT(kscaler_recommend_template, kscaler_recommendation,
 	     TP_PROTO(u64 quota, u64 period),
 	     TP_ARGS(quota, period));
 
-#define MAX_HISTORY 100
+#define MAX_HISTORY 10
 TRACE_DEFINE_SIZEOF(u64);
 /*
  * Tracepoint for all the current active se runtime-yield as observed by
