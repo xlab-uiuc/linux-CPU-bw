@@ -3,6 +3,9 @@ import numpy as np
 import ctypes
 import sys
 
+sys.path.append("../ks_common")
+import ks_common as ks
+
 class BoundData(ctypes.Structure):
     _fields_ = [
         ("runtime", ctypes.c_ulonglong),
@@ -43,7 +46,7 @@ def recommend_bound(cpu, data, size):
     bound_l["runtime"].append(bound_event.runtime)
     bound_l["yieldtime"].append(bound_event.yieldtime)
 
-    if (len(bound_l["runtime"]) > 4):
+    if (len(bound_l["runtime"]) > args.history_size):
         reco_bound = analyze(bound_l["runtime"], bound_l["yieldtime"])
         print(f"Recommendation bound{reco_bound}")
         bound_l["runtime"] = []
@@ -64,7 +67,7 @@ def recommend_agnostic(cpu, data, size):
     agnostic_l["runtime"].append(runtime_p99)
     agnostic_l["yieldtime"].append(yieldtime_p99)
 
-    if (len(agnostic_l["runtime"]) > 4):
+    if (len(agnostic_l["runtime"]) > args.history_size):
         reco_agnostic = analyze(agnostic_l["runtime"], agnostic_l["yieldtime"])
         print(f"Recommendation agnostic{reco_agnostic}")
         print(f"Recommendation bound--{reco_bound}")
@@ -81,15 +84,36 @@ def recommend_agnostic(cpu, data, size):
             quota =  reco_bound[0]
             period = reco_bound[0] + reco_bound[1]
         print(f"---Final recommendation: quota: {quota} period: {period}---")
+        if (args.action == "autotune"):
+            scaler.kscaler_apply(quota, period)
 
 # Open the perf buffer and start polling
 b["bound_events"].open_perf_buffer(recommend_bound)
 b["agnostic_events"].open_perf_buffer(recommend_agnostic)
-print("Tracing kscaler_bound_record... Hit Ctrl-C to end.")
 
-# Poll the perf buffer
+########### Initailizations begin
+
+# Add simple scaler specific args
+scaler = ks.KscalerConfig()
+scaler.parser.add_argument("--history-size", type=int, default=4)
+args = scaler.kscaler_init()
+
+print(args.container_name)
+print(args.action)
+print(args.history_size)
+
+cgroup_loc = scaler.get_cgroup()
+
+if (cgroup_loc == None):
+    print("could not find the container. Exiting..")
+    sys.exit()
+
+scaler.kscaler_activate()
+
 try:
     while True:
         b.perf_buffer_poll()
 except KeyboardInterrupt:
     sys.exit()
+
+print("Tracing kscaler_bound_record... Hit Ctrl-C to end.")
