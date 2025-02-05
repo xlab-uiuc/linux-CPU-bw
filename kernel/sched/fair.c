@@ -5883,6 +5883,10 @@ static bool period_agnostic_trace(struct cfs_bandwidth *cfs_b,
 	u64 curr_yield_time = 0;
 	s64 yield_time, runtime;
 
+	struct sched_entity_entry *entry;
+	int num_se = 0, idx = 0;
+	u64 *last_runtime, *last_yieldtime;
+
 	/*
 	 * The rq is currently not running on anything.
 	 * It is both a sanity check as well as to fend off against potential
@@ -5935,25 +5939,10 @@ reset_runtime:
 	if (!se->runtime_start)
 		se->runtime_start = rq_clock(rq);
 
-	/*
-	 * This ensures that at least one sched entity is ready to go and
-	 * has just seen a legitimate yeild
-	 */
-	return (se->pa_hist_idx >= cfs_b->period_agnostic_history - 1) && legit_yield;
-}
+	if (!legit_yield)
+		return false;
 
-static void period_agnostic_recommend(struct cfs_bandwidth *cfs_b)
-{
-	int percentile_idx = 0, num_se = 0;
-	struct sched_entity_entry *entry;
-
-	cfs_b->pa_recommender_quota = 0;
-	cfs_b->pa_recommender_period = 0;
-	cfs_b->pa_cpu = 0;
-
-	int idx = 0;
-	u64 *last_runtime, *last_yieldtime;
-
+	/* Trace all active sched enitities last runtime and yeild */
 	rcu_read_lock();
 	list_for_each_entry_rcu(entry, &cfs_b->active_sched_entity, list_node) {
 		num_se++;
@@ -5964,7 +5953,7 @@ static void period_agnostic_recommend(struct cfs_bandwidth *cfs_b)
 	last_yieldtime = kmalloc(num_se * sizeof(u64), GFP_KERNEL);
 	if (!last_runtime || !last_yieldtime) {
 		pr_err("Unable to allocate memory");
-		return;
+		return false;
 	}
 
 	rcu_read_lock();
@@ -5987,6 +5976,41 @@ static void period_agnostic_recommend(struct cfs_bandwidth *cfs_b)
 		idx++;
 
 		trace_kscaler_agnostic_record(temp_se);
+	}
+	rcu_read_unlock();
+	trace_kscaler_agnostic_se_record(last_runtime, last_yieldtime, num_se);
+	kfree(last_runtime);
+	kfree(last_yieldtime);
+
+	/*
+	 * This ensures that at least one sched entity is ready to go and
+	 * has just seen a legitimate yeild
+	 */
+	return (se->pa_hist_idx >= cfs_b->period_agnostic_history - 1) && legit_yield;
+}
+
+static void period_agnostic_recommend(struct cfs_bandwidth *cfs_b)
+{
+	int percentile_idx = 0;
+	struct sched_entity_entry *entry;
+
+	cfs_b->pa_recommender_quota = 0;
+	cfs_b->pa_recommender_period = 0;
+	cfs_b->pa_cpu = 0;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(entry, &cfs_b->active_sched_entity, list_node) {
+		struct sched_entity *temp_se = entry->se;
+
+		/* Skip se if NULL - most likely it idle now - root-cause later */
+		if (!temp_se) {
+			trace_printk("[RECOMMEND] sched entity is NULL\n");
+			continue;
+		}
+
+		/* Sanity size check*/
+		if (temp_se->pa_hist_idx <= 0)
+			continue;
 
 		sort(temp_se->pa_runtime_hist, temp_se->pa_hist_idx, sizeof(u64), cmp_u64, NULL);
 		sort(temp_se->pa_yield_hist, temp_se->pa_hist_idx, sizeof(u64), cmp_u64, NULL);
@@ -6006,15 +6030,10 @@ static void period_agnostic_recommend(struct cfs_bandwidth *cfs_b)
 	}
 	rcu_read_unlock();
 
-	trace_kscaler_agnostic_se_record(last_runtime, last_yieldtime, num_se);
-
 	if (cfs_b->pa_cpu)
 		cfs_b->pa_recommender_period = DIV_ROUND_UP_ULL(cfs_b->pa_recommender_quota * 100000, cfs_b->pa_cpu);
 
 	trace_kscaler_agnostic_recommendation(cfs_b->pa_recommender_quota, cfs_b->pa_recommender_period);
-
-	kfree(last_runtime);
-	kfree(last_yieldtime);
 }
 
 /* returns 0 on failure to allocate runtime */
